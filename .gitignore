@@ -3,3 +3,5 @@ __pycache__/
 *.pyc
 *.env
 security_rules.pdf
+.terraform/
+*.exe
