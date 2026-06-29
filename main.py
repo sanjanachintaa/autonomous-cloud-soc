@@ -9,10 +9,14 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import Chroma
 from langchain_huggingface import HuggingFaceEmbeddings
 import requests
+from dotenv import load_dotenv
+import os
+load_dotenv()
+
+SLACK_WEBHOOK = os.getenv('SLACK_WEBHOOK')
 
 # ─── CONFIG ───────────────────────────────────────────
 BUCKET_NAME = 'vulnerable-soc-bucket'
-SLACK_WEBHOOK = 'https://hooks.slack.com/services/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'
 
 s3_client = boto3.client(
     's3',
