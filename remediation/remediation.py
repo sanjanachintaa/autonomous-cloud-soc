@@ -2,6 +2,11 @@ import boto3
 import requests
 import json
 from datetime import datetime
+from dotenv import load_dotenv
+import os
+load_dotenv()
+
+SLACK_WEBHOOK = os.getenv('SLACK_WEBHOOK')
 
 # Connect to fake local AWS
 s3_client = boto3.client(
@@ -13,7 +18,7 @@ s3_client = boto3.client(
 )
 
 BUCKET_NAME = 'vulnerable-soc-bucket'
-SLACK_WEBHOOK = 'paste slack url here'  # Paste your Slack URL here
+
 
 def fix_public_bucket(bucket_name):
     print(f"🔧 Auto-remediating {bucket_name}...")
