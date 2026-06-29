@@ -1,7 +1,11 @@
-chroma_db/
-__pycache__/
-*.pyc
-*.env
-security_rules.pdf
+https://hooks.slack.com/services/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
 .terraform/
 *.exe
+__pycache__/
+*.pyc
+chroma_db/
+ai_agent/chroma_db/
+node_modules/
+.env
+security_rules.pdf
+frontend/build/

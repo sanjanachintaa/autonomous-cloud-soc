@@ -13,7 +13,7 @@ s3_client = boto3.client(
 )
 
 BUCKET_NAME = 'vulnerable-soc-bucket'
-SLACK_WEBHOOK = 'https://hooks.slack.com/services/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'  # Paste your Slack URL here
+SLACK_WEBHOOK = 'paste slack url here'  # Paste your Slack URL here
 
 def fix_public_bucket(bucket_name):
     print(f"🔧 Auto-remediating {bucket_name}...")
