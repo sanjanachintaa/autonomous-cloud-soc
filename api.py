@@ -9,14 +9,11 @@ from langchain_huggingface import HuggingFaceEmbeddings
 import ollama
 import requests
 from dotenv import load_dotenv
-import os
-load_dotenv()
 
-SLACK_WEBHOOK = os.getenv('SLACK_WEBHOOK')
+load_dotenv()
 
 app = FastAPI()
 
-# Allow React to talk to this API
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:3000"],
@@ -25,6 +22,7 @@ app.add_middleware(
 )
 
 BUCKET_NAME = 'vulnerable-soc-bucket'
+SLACK_WEBHOOK = os.getenv('SLACK_WEBHOOK')
 
 s3_client = boto3.client(
     's3',
@@ -34,7 +32,14 @@ s3_client = boto3.client(
     region_name='us-east-1'
 )
 
-# In memory threat log
+ec2_client = boto3.client(
+    'ec2',
+    endpoint_url='http://localhost:4566',
+    aws_access_key_id='fake',
+    aws_secret_access_key='fake',
+    region_name='us-east-1'
+)
+
 threat_history = []
 
 def load_knowledge_base():
@@ -44,6 +49,119 @@ def load_knowledge_base():
     return None
 
 db = load_knowledge_base()
+
+# ─── THREAT DETECTORS ─────────────────────────────────
+
+def check_public_bucket():
+    try:
+        acl = s3_client.get_bucket_acl(Bucket=BUCKET_NAME)
+        for grant in acl['Grants']:
+            grantee = grant.get('Grantee', {})
+            if grantee.get('URI') == 'http://acs.amazonaws.com/groups/global/AllUsers':
+                return {
+                    "id": len(threat_history) + 1,
+                    "timestamp": str(datetime.now()),
+                    "bucket": BUCKET_NAME,
+                    "threat": "PUBLIC_BUCKET_DETECTED",
+                    "severity": "CRITICAL",
+                    "detail": "S3 bucket is publicly accessible!",
+                    "fixed": False,
+                    "analysis": ""
+                }
+        return None
+    except Exception as e:
+        print(f"DEBUG public bucket error: {e}")
+        return None
+
+def check_versioning():
+    try:
+        result = s3_client.get_bucket_versioning(Bucket=BUCKET_NAME)
+        status = result.get('Status', '')
+        if status != 'Enabled':
+            return {
+                "id": len(threat_history) + 1,
+                "timestamp": str(datetime.now()),
+                "bucket": BUCKET_NAME,
+                "threat": "VERSIONING_DISABLED",
+                "severity": "HIGH",
+                "detail": "S3 bucket versioning is disabled — data loss risk!",
+                "fixed": False,
+                "analysis": ""
+            }
+        return None
+    except Exception as e:
+        print(f"DEBUG versioning error: {e}")
+        return None
+
+def check_open_security_group():
+    try:
+        sgs = ec2_client.describe_security_groups(GroupNames=['wide-open-sg'])
+        for sg in sgs['SecurityGroups']:
+            for perm in sg.get('IpPermissions', []):
+                if perm.get('FromPort') == 22:
+                    for ip_range in perm.get('IpRanges', []):
+                        if ip_range.get('CidrIp') == '0.0.0.0/0':
+                            return {
+                                "id": len(threat_history) + 1,
+                                "timestamp": str(datetime.now()),
+                                "bucket": "wide-open-sg",
+                                "threat": "OPEN_SECURITY_GROUP_SSH",
+                                "severity": "CRITICAL",
+                                "detail": "Port 22 (SSH) is open to the entire internet!",
+                                "fixed": False,
+                                "analysis": ""
+                            }
+        return None
+    except Exception as e:
+        print(f"DEBUG sg error: {e}")
+        return None
+
+# ─── AI ANALYSIS ──────────────────────────────────────
+
+def analyze_threat_with_ai(threat):
+    if not db:
+        return "Knowledge base not loaded"
+    try:
+        rules = db.similarity_search(f"{threat['threat']} security rule", k=2)
+        rules_text = "\n".join([doc.page_content for doc in rules])
+        prompt = f"""
+        Analyze this cloud security threat and respond in JSON only.
+        THREAT: {json.dumps(threat)}
+        RULES: {rules_text[:300]}
+        Respond: {{"severity": "{threat['severity']}", "threat_confirmed": true, "explanation": "brief explanation", "recommended_action": "action"}}
+        """
+        response = ollama.chat(model='tinyllama', messages=[{'role': 'user', 'content': prompt}])
+        return response['message']['content']
+    except Exception as e:
+        return f"AI analysis error: {e}"
+
+# ─── REMEDIATION ──────────────────────────────────────
+
+def remediate_threat(threat):
+    try:
+        if threat['threat'] == 'PUBLIC_BUCKET_DETECTED':
+            s3_client.put_bucket_acl(Bucket=BUCKET_NAME, ACL='private')
+            return True
+        elif threat['threat'] == 'VERSIONING_DISABLED':
+            s3_client.put_bucket_versioning(
+                Bucket=BUCKET_NAME,
+                VersioningConfiguration={'Status': 'Enabled'}
+            )
+            return True
+        elif threat['threat'] == 'OPEN_SECURITY_GROUP_SSH':
+            ec2_client.revoke_security_group_ingress(
+                GroupName='wide-open-sg',
+                IpPermissions=[{
+                    'IpProtocol': 'tcp',
+                    'FromPort': 22,
+                    'ToPort': 22,
+                    'IpRanges': [{'CidrIp': '0.0.0.0/0'}]
+                }]
+            )
+            return True
+    except Exception as e:
+        print(f"Remediation error: {e}")
+        return False
 
 # ─── API ROUTES ───────────────────────────────────────
 
@@ -77,57 +195,50 @@ def get_metrics():
 
 @app.post("/api/scan")
 def run_scan():
-    try:
-        acl = s3_client.get_bucket_acl(Bucket=BUCKET_NAME)
-        for grant in acl['Grants']:
-            grantee = grant.get('Grantee', {})
-            if grantee.get('URI') == 'http://acs.amazonaws.com/groups/global/AllUsers':
-                threat = {
-                    "id": len(threat_history) + 1,
-                    "timestamp": str(datetime.now()),
-                    "bucket": BUCKET_NAME,
-                    "threat": "PUBLIC_BUCKET_DETECTED",
-                    "severity": "CRITICAL",
-                    "detail": "S3 bucket is publicly accessible!",
-                    "fixed": False,
-                    "analysis": ""
-                }
+    detected_threats = []
 
-                # AI Analysis
-                if db:
-                    rules = db.similarity_search("S3 public bucket security rule", k=2)
-                    rules_text = "\n".join([doc.page_content for doc in rules])
-                    prompt = f"""
-                    Analyze this cloud security threat and respond in JSON only.
-                    THREAT: {json.dumps(threat)}
-                    RULES: {rules_text[:300]}
-                    Respond: {{"severity": "CRITICAL", "threat_confirmed": true, "explanation": "brief explanation", "recommended_action": "action"}}
-                    """
-                    response = ollama.chat(model='tinyllama', messages=[{'role': 'user', 'content': prompt}])
-                    threat["analysis"] = response['message']['content']
+    public_threat = check_public_bucket()
+    if public_threat:
+        detected_threats.append(public_threat)
 
-                # Auto remediate
-                s3_client.put_bucket_acl(Bucket=BUCKET_NAME, ACL='private')
-                threat["fixed"] = True
+    versioning_threat = check_versioning()
+    if versioning_threat:
+        detected_threats.append(versioning_threat)
 
-                threat_history.append(threat)
+    sg_threat = check_open_security_group()
+    if sg_threat:
+        detected_threats.append(sg_threat)
 
-                # Slack alert
-                requests.post(SLACK_WEBHOOK, json={
-                    "text": f"🚨 *CloudSentinel Alert*\nThreat: {threat['threat']}\nStatus: ✅ AUTO-FIXED\nTime: {threat['timestamp']}"
-                })
-
-                return {"detected": True, "threat": threat}
-
+    if not detected_threats:
         return {"detected": False, "message": "All clear — no threats found"}
 
-    except Exception as e:
-        return {"error": str(e)}
+    for threat in detected_threats:
+        threat["analysis"] = analyze_threat_with_ai(threat)
+        threat["fixed"] = remediate_threat(threat)
+        threat_history.append(threat)
+
+        if SLACK_WEBHOOK:
+            requests.post(SLACK_WEBHOOK, json={
+                "text": f"🚨 *CloudSentinel Alert*\nThreat: {threat['threat']}\nSeverity: {threat['severity']}\nStatus: {'✅ AUTO-FIXED' if threat['fixed'] else '❌ FIX FAILED'}\nTime: {threat['timestamp']}"
+            })
+
+    return {"detected": True, "threats": detected_threats}
 
 @app.post("/api/reset-bucket")
 def reset_bucket():
     try:
         s3_client.put_bucket_acl(Bucket=BUCKET_NAME, ACL='public-read')
         return {"message": "Bucket reset to public (vulnerable) for testing"}
+    except Exception as e:
+        return {"error": str(e)}
+
+@app.post("/api/reset-versioning")
+def reset_versioning():
+    try:
+        s3_client.put_bucket_versioning(
+            Bucket=BUCKET_NAME,
+            VersioningConfiguration={'Status': 'Suspended'}
+        )
+        return {"message": "Versioning suspended for testing"}
     except Exception as e:
         return {"error": str(e)}
