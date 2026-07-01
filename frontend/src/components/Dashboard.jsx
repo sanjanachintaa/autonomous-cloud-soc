@@ -1,5 +1,5 @@
-import React, { useState, useEffect } from 'react';
-import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer } from 'recharts';
+import React, { useState, useEffect, useRef } from 'react';
+import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer, BarChart, Bar } from 'recharts';
 import axios from 'axios';
 
 const API = 'http://127.0.0.1:8000';
@@ -7,11 +7,16 @@ const API = 'http://127.0.0.1:8000';
 export default function Dashboard() {
   const [metrics, setMetrics] = useState({ total_threats: 0, auto_fixed: 0, critical: 0, rules_active: 0 });
   const [threats, setThreats] = useState([]);
+  const [siem, setSiem] = useState(null);
+  const [timeline, setTimeline] = useState([]);
   const [scanning, setScanning] = useState(false);
   const [status, setStatus] = useState('idle');
   const [lastScan, setLastScan] = useState(null);
   const [autoScan, setAutoScan] = useState(false);
-  const [siem, setSiem] = useState(null);
+  const [selectedThreat, setSelectedThreat] = useState(null);
+  const [threatDetail, setThreatDetail] = useState(null);
+  const [notifications, setNotifications] = useState([]);
+  const notifId = useRef(0);
 
   useEffect(() => {
     fetchData();
@@ -21,22 +26,40 @@ export default function Dashboard() {
 
   useEffect(() => {
     if (!autoScan) return;
-    const interval = setInterval(() => {
-      runScan();
-    }, 15000);
+    const interval = setInterval(() => { runScan(); }, 15000);
     return () => clearInterval(interval);
   }, [autoScan]);
 
+  // Real-time alert stream
+  useEffect(() => {
+    const es = new EventSource(`${API}/api/alerts/stream`);
+    es.onmessage = (e) => {
+      const threat = JSON.parse(e.data);
+      addNotification(threat);
+    };
+    return () => es.close();
+  }, []);
+
+  const addNotification = (threat) => {
+    const id = notifId.current++;
+    setNotifications(prev => [...prev, { ...threat, notifId: id }]);
+    setTimeout(() => {
+      setNotifications(prev => prev.filter(n => n.notifId !== id));
+    }, 5000);
+  };
+
   const fetchData = async () => {
     try {
-      const [metricsRes, threatsRes, siemRes] = await Promise.all([
+      const [metricsRes, threatsRes, siemRes, timelineRes] = await Promise.all([
         axios.get(`${API}/api/metrics`),
         axios.get(`${API}/api/threats`),
-        axios.get(`${API}/api/siem/risk`)
+        axios.get(`${API}/api/siem/risk`),
+        axios.get(`${API}/api/siem/timeline`)
       ]);
       setMetrics(metricsRes.data);
       setThreats([...threatsRes.data.threats].reverse());
       setSiem(siemRes.data);
+      setTimeline(timelineRes.data.timeline);
     } catch (e) {
       console.error(e);
     }
@@ -71,15 +94,111 @@ export default function Dashboard() {
     }
   };
 
-  const chartData = [...threats].reverse().slice(-10).map((t, i) => ({
+  const openThreatDetail = async (threat) => {
+    setSelectedThreat(threat);
+    try {
+      const res = await axios.get(`${API}/api/threats/${threat.id}`);
+      setThreatDetail(res.data);
+    } catch (e) {
+      setThreatDetail({ threat, related_correlations: [] });
+    }
+  };
+
+  const severityColor = (s) => s === 'CRITICAL' ? '#ef4444' : s === 'HIGH' ? '#f59e0b' : '#2dd4bf';
+
+  const chartData = [...threats].reverse().slice(-10).map((t) => ({
     name: new Date(t.timestamp).toLocaleTimeString(),
-    threats: 1,
+    score: t.score || 50,
   }));
 
-  const severityColor = (s) => s === 'CRITICAL' ? '#ef4444' : '#f59e0b';
+  const timelineData = timeline.slice(-8).map(t => ({
+    name: t.event.split(' ').slice(0, 2).join(' '),
+    score: t.score,
+    fixed: t.fixed ? 1 : 0,
+  }));
+
+  const riskColor = siem?.risk?.level === 'CRITICAL' ? '#ef4444' : siem?.risk?.level === 'HIGH' ? '#f59e0b' : '#2dd4bf';
 
   return (
     <div style={styles.page}>
+
+      {/* REAL TIME NOTIFICATIONS */}
+      <div style={styles.notifContainer}>
+        {notifications.map(n => (
+          <div key={n.notifId} style={{ ...styles.notif, borderLeft: `4px solid ${severityColor(n.severity)}` }}>
+            <div style={{ fontSize: 13, fontWeight: 700, color: severityColor(n.severity) }}>
+              🚨 {n.threat.replace(/_/g, ' ')}
+            </div>
+            <div style={{ fontSize: 11, color: '#64748b', marginTop: 2 }}>{n.detail}</div>
+            <div style={{ fontSize: 10, color: '#94a3b8', marginTop: 2 }}>
+              {n.fixed ? '✅ Auto-fixed' : '❌ Fix failed'}
+            </div>
+          </div>
+        ))}
+      </div>
+
+      {/* THREAT DETAIL MODAL */}
+      {selectedThreat && (
+        <div style={styles.modalOverlay} onClick={() => { setSelectedThreat(null); setThreatDetail(null); }}>
+          <div style={styles.modal} onClick={e => e.stopPropagation()}>
+            <div style={styles.modalHeader}>
+              <div style={{ fontSize: 15, fontWeight: 700, color: '#0f172a' }}>
+                🔍 Threat Investigation
+              </div>
+              <button style={styles.closeBtn} onClick={() => { setSelectedThreat(null); setThreatDetail(null); }}>✕</button>
+            </div>
+
+            <div style={styles.modalSection}>
+              <div style={styles.modalLabel}>Threat Type</div>
+              <div style={{ ...styles.modalValue, color: severityColor(selectedThreat.severity) }}>
+                {selectedThreat.threat.replace(/_/g, ' ')}
+              </div>
+            </div>
+
+            <div style={styles.modalSection}>
+              <div style={styles.modalLabel}>Detail</div>
+              <div style={styles.modalValue}>{selectedThreat.detail}</div>
+            </div>
+
+            <div style={styles.modalSection}>
+              <div style={styles.modalLabel}>CIS Rule Violated</div>
+              <div style={{ ...styles.modalValue, color: '#6366f1' }}>{selectedThreat.cis_rule || 'N/A'}</div>
+            </div>
+
+            <div style={styles.modalSection}>
+              <div style={styles.modalLabel}>Risk Score</div>
+              <div style={{ ...styles.modalValue, color: severityColor(selectedThreat.severity) }}>
+                {selectedThreat.score}/100
+              </div>
+            </div>
+
+            <div style={styles.modalSection}>
+              <div style={styles.modalLabel}>Status</div>
+              <div style={styles.modalValue}>{selectedThreat.fixed ? '✅ Auto-remediated' : '❌ Not fixed'}</div>
+            </div>
+
+            <div style={styles.modalSection}>
+              <div style={styles.modalLabel}>AI Analysis</div>
+              <div style={{ ...styles.modalValue, fontSize: 11, background: '#f8fafc', padding: 10, borderRadius: 6, whiteSpace: 'pre-wrap', maxHeight: 150, overflowY: 'auto' }}>
+                {selectedThreat.analysis || 'No analysis available'}
+              </div>
+            </div>
+
+            {threatDetail?.related_correlations?.length > 0 && (
+              <div style={styles.modalSection}>
+                <div style={styles.modalLabel}>Related Attack Scenarios</div>
+                {threatDetail.related_correlations.map((c, i) => (
+                  <div key={i} style={{ background: '#fef2f2', border: '1px solid #fecaca', borderRadius: 6, padding: 8, marginTop: 6 }}>
+                    <div style={{ fontSize: 12, fontWeight: 700, color: '#ef4444' }}>{c.name.replace(/_/g, ' ')}</div>
+                    <div style={{ fontSize: 11, color: '#64748b', marginTop: 2 }}>{c.recommendation}</div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
       {/* HEADER */}
       <div style={styles.header}>
         <div style={styles.logoGroup}>
@@ -99,24 +218,14 @@ export default function Dashboard() {
       <div style={styles.body}>
         {/* SIDEBAR */}
         <div style={styles.sidebar}>
-          {[
-            { label: 'Dashboard', active: true },
-            { label: 'Threats' },
-            { label: 'Remediation' },
-            { label: 'Reports' },
-            { label: 'Settings' },
-          ].map(item => (
-            <div key={item.label} style={{ ...styles.navItem, ...(item.active ? styles.navActive : {}) }}>
-              {item.label}
+          {['Dashboard', 'Threats', 'Remediation', 'Reports', 'Settings'].map((item, i) => (
+            <div key={item} style={{ ...styles.navItem, ...(i === 0 ? styles.navActive : {}) }}>
+              {item}
             </div>
           ))}
-
           <div style={styles.sidebarDivider} />
           <div style={styles.sidebarLabel}>Auto Scan</div>
-          <div
-            style={{ ...styles.autoToggle, background: autoScan ? '#2dd4bf' : '#e2e8f0' }}
-            onClick={() => setAutoScan(!autoScan)}
-          >
+          <div style={{ ...styles.autoToggle, background: autoScan ? '#2dd4bf' : '#e2e8f0' }} onClick={() => setAutoScan(!autoScan)}>
             <div style={{ ...styles.toggleDot, transform: autoScan ? 'translateX(20px)' : 'translateX(2px)' }} />
           </div>
           {autoScan && <div style={styles.autoLabel}>Scanning every 15s</div>}
@@ -128,10 +237,10 @@ export default function Dashboard() {
           {/* METRICS */}
           <div style={styles.metricsGrid}>
             {[
-              { label: 'Active Threats', value: metrics.critical, color: '#ef4444', bg: '#fef2f2' },
-              { label: 'Auto Fixed', value: metrics.auto_fixed, color: '#2dd4bf', bg: '#f0fdfa' },
-              { label: 'Total Detected', value: metrics.total_threats, color: '#6366f1', bg: '#eef2ff' },
-              { label: 'Rules Active', value: metrics.rules_active, color: '#f59e0b', bg: '#fffbeb' },
+              { label: 'Active Threats', value: metrics.critical, color: '#ef4444' },
+              { label: 'Auto Fixed', value: metrics.auto_fixed, color: '#2dd4bf' },
+              { label: 'Total Detected', value: metrics.total_threats, color: '#6366f1' },
+              { label: 'Rules Active', value: metrics.rules_active, color: '#f59e0b' },
             ].map(m => (
               <div key={m.label} style={{ ...styles.metricCard, borderTop: `3px solid ${m.color}` }}>
                 <div style={styles.metricLabel}>{m.label}</div>
@@ -140,54 +249,65 @@ export default function Dashboard() {
             ))}
           </div>
 
-          {/* SIEM RISK PANEL */}
+          {/* SIEM RISK + CORRELATIONS */}
           {siem && (
             <div style={styles.row}>
-              <div style={{ ...styles.card, flex: 1, borderTop: `3px solid ${siem.risk.level === 'CRITICAL' ? '#ef4444' : siem.risk.level === 'HIGH' ? '#f59e0b' : '#2dd4bf'}` }}>
+              <div style={{ ...styles.card, flex: 1, borderTop: `3px solid ${riskColor}` }}>
                 <div style={styles.cardTitle}>Overall Risk Score</div>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 16 }}>
-                  <div style={{ fontSize: 48, fontWeight: 800, color: siem.risk.level === 'CRITICAL' ? '#ef4444' : '#f59e0b' }}>
-                    {siem.risk.score}
-                  </div>
+                  <div style={{ fontSize: 52, fontWeight: 800, color: riskColor }}>{siem.risk.score}</div>
                   <div>
-                    <div style={{ fontSize: 14, fontWeight: 700, color: siem.risk.level === 'CRITICAL' ? '#ef4444' : '#f59e0b' }}>
-                      {siem.risk.level}
-                    </div>
-                    <div style={{ fontSize: 11, color: '#64748b', maxWidth: 200 }}>{siem.risk.summary}</div>
+                    <div style={{ fontSize: 14, fontWeight: 700, color: riskColor }}>{siem.risk.level}</div>
+                    <div style={{ fontSize: 11, color: '#64748b', maxWidth: 180 }}>{siem.risk.summary}</div>
                   </div>
                 </div>
               </div>
 
               <div style={{ ...styles.card, flex: 2 }}>
                 <div style={styles.cardTitle}>Threat Correlations</div>
-                {siem.correlations.length === 0 && (
-                  <div style={styles.emptyState}>No correlations detected</div>
-                )}
-                {siem.correlations.map((c, i) => (
-                  <div key={i} style={styles.correlationRow}>
-                    <div style={styles.correlationName}>{c.name.replace(/_/g, ' ')}</div>
-                    <div style={styles.correlationDesc}>{c.recommendation}</div>
-                    <div style={{ ...styles.badge, background: '#fef2f2', color: '#ef4444', marginTop: 4, display: 'inline-block' }}>
-                      Score: {c.score}
+                {siem.correlations.length === 0
+                  ? <div style={styles.emptyState}>No correlations — run a scan first</div>
+                  : siem.correlations.map((c, i) => (
+                    <div key={i} style={styles.correlationRow}>
+                      <div style={styles.correlationName}>{c.name.replace(/_/g, ' ')}</div>
+                      <div style={styles.correlationDesc}>{c.recommendation}</div>
+                      <span style={{ ...styles.badge, background: '#fef2f2', color: '#ef4444', marginTop: 4, display: 'inline-block' }}>
+                        Score: {c.score}
+                      </span>
                     </div>
-                  </div>
-                ))}
+                  ))
+                }
               </div>
             </div>
           )}
 
-          {/* CHART + CONTROLS ROW */}
+          {/* CHARTS ROW */}
           <div style={styles.row}>
-            <div style={{ ...styles.card, flex: 2 }}>
-              <div style={styles.cardTitle}>Threat Activity</div>
+            <div style={{ ...styles.card, flex: 1 }}>
+              <div style={styles.cardTitle}>Threat Score History</div>
               <ResponsiveContainer width="100%" height={120}>
                 <AreaChart data={chartData}>
                   <XAxis dataKey="name" stroke="#94a3b8" tick={{ fontSize: 9 }} />
-                  <YAxis stroke="#94a3b8" tick={{ fontSize: 9 }} />
+                  <YAxis stroke="#94a3b8" tick={{ fontSize: 9 }} domain={[0, 100]} />
                   <Tooltip />
-                  <Area type="monotone" dataKey="threats" stroke="#2dd4bf" fill="#ccfbf1" />
+                  <Area type="monotone" dataKey="score" stroke="#ef4444" fill="#fef2f2" />
                 </AreaChart>
               </ResponsiveContainer>
+            </div>
+
+            <div style={{ ...styles.card, flex: 1 }}>
+              <div style={styles.cardTitle}>Attack Timeline</div>
+              {timelineData.length === 0
+                ? <div style={styles.emptyState}>No timeline data yet</div>
+                : <ResponsiveContainer width="100%" height={120}>
+                  <BarChart data={timelineData}>
+                    <XAxis dataKey="name" stroke="#94a3b8" tick={{ fontSize: 9 }} />
+                    <YAxis stroke="#94a3b8" tick={{ fontSize: 9 }} domain={[0, 100]} />
+                    <Tooltip />
+                    <Bar dataKey="score" fill="#6366f1" radius={[4, 4, 0, 0]} />
+                  </BarChart>
+                </ResponsiveContainer>
+              }
             </div>
 
             <div style={{ ...styles.card, flex: 1, display: 'flex', flexDirection: 'column', gap: 10 }}>
@@ -196,11 +316,10 @@ export default function Dashboard() {
                 {scanning ? '⏳ Scanning...' : '🔍 Run Scan'}
               </button>
               <button style={styles.resetBtn} onClick={resetAll}>
-                ⚠️ Reset All Vulnerabilities
+                ⚠️ Reset All
               </button>
               {status === 'threat_found' && <div style={styles.alertBadge}>🚨 Threats detected & fixed!</div>}
               {status === 'clear' && <div style={styles.clearBadge}>✅ All clear!</div>}
-              {status === 'scanning' && <div style={styles.scanningBadge}>⏳ Scanning...</div>}
             </div>
           </div>
 
@@ -208,28 +327,23 @@ export default function Dashboard() {
           <div style={styles.card}>
             <div style={styles.cardTitleRow}>
               <div style={styles.cardTitle}>Live Threat Feed</div>
-              <div style={styles.threatCount}>{threats.length} total</div>
+              <div style={styles.threatCount}>{threats.length} total — click any row to investigate</div>
             </div>
-            {threats.length === 0 && (
-              <div style={styles.emptyState}>No threats detected yet — run a scan!</div>
-            )}
+            {threats.length === 0 && <div style={styles.emptyState}>No threats detected yet — run a scan!</div>}
             {threats.map((t, i) => (
-              <div key={i} style={styles.threatRow}>
+              <div key={i} style={{ ...styles.threatRow, cursor: 'pointer' }} onClick={() => openThreatDetail(t)}>
                 <div style={{ ...styles.severityBar, background: severityColor(t.severity) }} />
                 <div style={styles.threatInfo}>
                   <div style={styles.threatName}>{t.threat.replace(/_/g, ' ')}</div>
                   <div style={styles.threatDetail}>{t.detail}</div>
+                  <div style={{ fontSize: 10, color: '#6366f1', marginTop: 2 }}>{t.cis_rule}</div>
                 </div>
                 <div style={styles.threatMeta}>
                   <div style={{ ...styles.badge, background: severityColor(t.severity) + '20', color: severityColor(t.severity) }}>
                     {t.severity}
                   </div>
-                  <div style={styles.fixedBadge}>
-                    {t.fixed ? '✅ AUTO-FIXED' : '❌ FAILED'}
-                  </div>
-                  <div style={styles.threatTime}>
-                    {new Date(t.timestamp).toLocaleTimeString()}
-                  </div>
+                  <div style={styles.fixedBadge}>{t.fixed ? '✅ AUTO-FIXED' : '❌ FAILED'}</div>
+                  <div style={styles.threatTime}>{new Date(t.timestamp).toLocaleTimeString()}</div>
                 </div>
               </div>
             ))}
@@ -243,6 +357,15 @@ export default function Dashboard() {
 
 const styles = {
   page: { minHeight: '100vh', background: '#f8fafc', fontFamily: 'system-ui, sans-serif' },
+  notifContainer: { position: 'fixed', top: 16, right: 16, zIndex: 1000, display: 'flex', flexDirection: 'column', gap: 8, maxWidth: 320 },
+  notif: { background: '#fff', border: '1px solid #e2e8f0', borderRadius: 8, padding: '10px 14px', boxShadow: '0 4px 12px rgba(0,0,0,0.1)', animation: 'slideIn 0.3s ease' },
+  modalOverlay: { position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.4)', zIndex: 500, display: 'flex', alignItems: 'center', justifyContent: 'center' },
+  modal: { background: '#fff', borderRadius: 12, padding: 24, width: 480, maxHeight: '80vh', overflowY: 'auto', boxShadow: '0 20px 60px rgba(0,0,0,0.2)' },
+  modalHeader: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 },
+  modalSection: { marginBottom: 14 },
+  modalLabel: { fontSize: 10, color: '#94a3b8', textTransform: 'uppercase', letterSpacing: '0.5px', marginBottom: 4, fontWeight: 600 },
+  modalValue: { fontSize: 13, color: '#0f172a', fontWeight: 500 },
+  closeBtn: { background: 'none', border: 'none', fontSize: 16, cursor: 'pointer', color: '#94a3b8' },
   header: { background: '#fff', borderBottom: '1px solid #e2e8f0', padding: '12px 24px', display: 'flex', alignItems: 'center', justifyContent: 'space-between', position: 'sticky', top: 0, zIndex: 10 },
   logoGroup: { display: 'flex', alignItems: 'center', gap: 10 },
   logoText: { fontSize: 18, fontWeight: 700, color: '#0f172a' },
@@ -275,7 +398,6 @@ const styles = {
   resetBtn: { background: '#fff', color: '#ef4444', border: '1px solid #fecaca', borderRadius: 8, padding: '10px 16px', fontSize: 13, cursor: 'pointer', width: '100%' },
   alertBadge: { background: '#fef2f2', color: '#ef4444', border: '1px solid #fecaca', borderRadius: 8, padding: '8px 12px', fontSize: 11, textAlign: 'center' },
   clearBadge: { background: '#f0fdfa', color: '#2dd4bf', border: '1px solid #99f6e4', borderRadius: 8, padding: '8px 12px', fontSize: 11, textAlign: 'center' },
-  scanningBadge: { background: '#fffbeb', color: '#f59e0b', border: '1px solid #fde68a', borderRadius: 8, padding: '8px 12px', fontSize: 11, textAlign: 'center' },
   threatRow: { display: 'flex', alignItems: 'center', gap: 12, padding: '10px 0', borderBottom: '1px solid #f1f5f9' },
   severityBar: { width: 3, height: 40, borderRadius: 2, flexShrink: 0 },
   threatInfo: { flex: 1 },
@@ -288,4 +410,5 @@ const styles = {
   emptyState: { color: '#94a3b8', fontSize: 13, textAlign: 'center', padding: '30px 0' },
   correlationRow: { padding: '8px 0', borderBottom: '1px solid #f1f5f9' },
   correlationName: { fontSize: 12, fontWeight: 700, color: '#0f172a', marginBottom: 2 },
-  correlationDesc: { fontSize: 11, color: '#64748b' }};
+  correlationDesc: { fontSize: 11, color: '#64748b' },
+};
