@@ -1,3 +1,4 @@
+from siem import correlate_threats, assess_overall_risk, build_attack_timeline, get_threat_score
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import boto3
@@ -240,5 +241,39 @@ def reset_versioning():
             VersioningConfiguration={'Status': 'Suspended'}
         )
         return {"message": "Versioning suspended for testing"}
+    except Exception as e:
+        return {"error": str(e)}
+@app.get("/api/siem/risk")
+def get_risk_assessment():
+    recent_threats = [t for t in threat_history if not t['fixed']]
+    correlations = correlate_threats(threat_history)
+    risk = assess_overall_risk(threat_history, correlations)
+    return {
+        "risk": risk,
+        "correlations": correlations
+    }
+
+@app.get("/api/siem/timeline")
+def get_timeline():
+    timeline = build_attack_timeline(threat_history)
+    return {"timeline": timeline}
+
+@app.get("/api/siem/correlations")
+def get_correlations():
+    correlations = correlate_threats(threat_history)
+    return {"correlations": correlations}
+@app.post("/api/reset-security-group")
+def reset_security_group():
+    try:
+        ec2_client.authorize_security_group_ingress(
+            GroupName='wide-open-sg',
+            IpPermissions=[{
+                'IpProtocol': 'tcp',
+                'FromPort': 22,
+                'ToPort': 22,
+                'IpRanges': [{'CidrIp': '0.0.0.0/0'}]
+            }]
+        )
+        return {"message": "Security group reset to vulnerable"}
     except Exception as e:
         return {"error": str(e)}
